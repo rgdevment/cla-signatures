@@ -18,21 +18,12 @@ script=$(awk '
 CLA_LIBRARY=1
 # bash 3.2 on macOS cannot source a process substitution.
 lib=$(mktemp)
-trap 'rm -f "$lib"' EXIT
+event=$(mktemp)
+trap 'rm -f "$lib" "$event"' EXIT
 printf '%s\n' "$script" > "$lib"
 # shellcheck disable=SC1090
 source "$lib"
 set +e
-
-gh() {
-  case "$*" in
-    "api users/olduser --jq .id") echo 42 ;;
-    "api users/alice --jq .id") echo 7 ;;
-    *"search/users"*"alice@example.com in:email"*) echo alice ;;
-    *"search/users"*) echo "" ;;
-    *) echo "unexpected gh $*" >&2; return 1 ;;
-  esac
-}
 
 failed=0
 same() {
@@ -45,32 +36,30 @@ same() {
 }
 
 commits='[
-  {"author": {"id": 1, "login": "rgdevment"},
-   "commit": {"author": {"name": "R", "email": "r@example.com"},
-              "message": "feat: one\n\nbody\n\nCo-authored-by: New Person <99+newbie@users.noreply.github.com>\nco-authored-by:  Some Tool  <bot@tool.example>"}},
-  {"author": null,
-   "commit": {"author": {"name": "Unlinked", "email": "Unlinked@Example.com"}, "message": "fix: two"}},
-  {"author": {"id": 1, "login": "rgdevment"},
-   "commit": {"author": {"name": "R", "email": "r@example.com"},
-              "message": "chore: three\n\nCo-authored-by: Old <olduser@users.noreply.github.com>\nCo-authored-by: Alice <alice@example.com>\nnot a trailer: Co-authored-by: Nobody <x@y.z>"}}
+  {"commit": {"authors": {"nodes": [
+    {"email": "r@example.com", "name": "R", "user": {"databaseId": 1, "login": "rgdevment"}},
+    {"email": "private@example.com", "name": "New Person", "user": {"databaseId": 99, "login": "newbie"}},
+    {"email": "bot@tool.example", "name": "Some Tool", "user": null}]}}},
+  {"commit": {"authors": {"nodes": [
+    {"email": "Unlinked@Example.com", "name": "Unlinked", "user": null}]}}},
+  {"commit": {"authors": {"nodes": [
+    {"email": "r@example.com", "name": "R", "user": {"databaseId": 1, "login": "rgdevment"}},
+    {"email": "old@example.com", "name": "Old", "user": {"databaseId": 42, "login": "olduser"}}]}}}
 ]'
 
-same "every author and co-author, once" "$(people <<< "$commits")" "$(printf '%s\n' \
-  $'account\t1\trgdevment' \
-  $'email\t99+newbie@users.noreply.github.com\tNew Person' \
-  $'email\talice@example.com\tAlice' \
-  $'email\tbot@tool.example\tSome Tool' \
-  $'email\tolduser@users.noreply.github.com\tOld' \
-  $'email\tunlinked@example.com\tUnlinked' | sort -u)"
-
-resolved=$(people <<< "$commits" | resolve)
-same "an address resolves to its account, or stays an address" "$resolved" "$(printf '%s\n' \
+people_seen=$(people <<< "$commits")
+same "every author and co-author, once" "$people_seen" "$(printf '%s\n' \
   $'account\t1\trgdevment' \
   $'account\t42\tolduser' \
-  $'account\t7\talice' \
   $'account\t99\tnewbie' \
   $'email\tbot@tool.example\tSome Tool' \
   $'email\tunlinked@example.com\tUnlinked' | sort -u -t $'\t' -k1,2)"
+
+GITHUB_EVENT_PATH=$event
+printf '{"pull_request": {"number": 5, "user": {"id": 7, "login": "alice"}}}' > "$event"
+same "whoever opened the pull request is named" "$(opener)" $'account\t7\talice'
+printf '{"issue": {"number": 5, "user": {"id": 7, "login": "alice"}}, "comment": {}}' > "$event"
+same "and named the same from a comment" "$(opener)" $'account\t7\talice'
 
 ALLOWLIST='rgdevment, dependabot[bot] ,ci-*'
 allowed rgdevment && a=yes || a=no
@@ -85,16 +74,29 @@ allowed rgdevment2 && a=yes || a=no
 same "a prefix is not the name" "$a" no
 
 signatures='{"signedContributors": [{"name": "olduser", "id": 42}]}'
-same "who still owes a signature" "$(unsigned "$signatures" <<< "$resolved")" "$(printf '%s\n' \
+everyone=$({ printf '%s\n' "$people_seen"; opener; } | sort -u -t $'\t' -k1,2)
+same "who still owes a signature" "$(unsigned "$signatures" <<< "$everyone")" "$(printf '%s\n' \
   $'account\t7\talice' \
   $'account\t99\tnewbie' \
   $'email\tbot@tool.example\tSome Tool' \
   $'email\tunlinked@example.com\tUnlinked')"
-
 same "nobody owes anything on an empty pull request" "$(unsigned "$signatures" <<< "")" ""
 
+# What the Contents API hands back: base64 broken every 60 characters.
+long=$(jq -n '{signedContributors: [range(5) | {name: "someone\(.)", id: ., comment_id: 1, created_at: "x", repoId: 1, pullRequestNo: 1}]}')
+wrapped=$(printf '%s\n' "$long" | base64 | tr -d '\n' | fold -w 60)
+file=$(jq -n --arg content "$wrapped" '{content: $content, sha: "abc"}')
+same "a wrapped file decodes" "$(decoded <<< "$file" | jq -c '.signedContributors | length')" 5
+
+same "the phrase signs" "$(printf 'I have read the CLA Document and I hereby sign the CLA' | plain)" \
+  "i have read the cla document and i hereby sign the cla"
+same "case, spacing and a full stop do not" \
+  "$(printf '  I have read the CLA document  and I hereby sign the CLA.\n' | plain)" \
+  "i have read the cla document and i hereby sign the cla"
+same "a different sentence does not sign" "$(printf 'I have read the CLA' | plain)" "i have read the cla"
+
 NOT_SIGNED="Sign it." SIGN_PHRASE="I sign" DOCUMENT_URL="https://example.com/CLA.md"
-said=$(worded "$(unsigned "$signatures" <<< "$resolved")")
+said=$(worded "$(unsigned "$signatures" <<< "$everyone")")
 same "the comment carries its marker first" "$(head -1 <<< "$said")" "$marker"
 same "the comment names an account by mention" "$(grep -c '^- @alice$' <<< "$said")" 1
 same "an address is never mentioned as a login" "$(grep -c '@bot@tool' <<< "$said")" 0

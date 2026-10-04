@@ -64,53 +64,31 @@ jobs:
           ALL_SIGNED: ${{ inputs.all-signed-message }}
         run: |
           set -euo pipefail
+          shopt -s inherit_errexit 2> /dev/null || true
 
           marker='<!-- cla-signatures -->'
 
           say() { printf '%s\n' "$*" >&2; }
 
-          # Commits as the REST API lists them, to one line per person who wrote them:
-          # «account<TAB>id<TAB>login» when GitHub tied the email to someone, «email<TAB>address<TAB>name»
-          # otherwise. A Co-authored-by trailer is a claim of authorship like the author field.
+          # GitHub's own reading of each commit: the git author first, then every Co-authored-by
+          # trailer, each tied to an account by any verified address, private ones included. One line
+          # per person: «account<TAB>id<TAB>login», or «email<TAB>address<TAB>name» with no account.
           people() {
             jq -r '
-              .[]
-              | (if .author.id then ["account", (.author.id | tostring), .author.login]
-                 else ["email", (.commit.author.email | ascii_downcase), .commit.author.name] end),
-                (.commit.message
-                 | [scan("(?im)^co-authored-by:[ \\t]*([^<\\n]*?)[ \\t]*<([^>\\n]+)>[ \\t]*$")]
-                 | .[]
-                 | ["email", (.[1] | ascii_downcase), .[0]])
-              | @tsv' | sort -u
+              .[].commit.authors.nodes[]
+              | if .user.databaseId then ["account", (.user.databaseId | tostring), .user.login]
+                else ["email", ((.email // "") | ascii_downcase), (.name // "")] end
+              | @tsv' | sort -u -t $'\t' -k1,2
           }
 
-          # An address GitHub hands out names its account outright; any other has to be public on one.
-          resolve() {
-            local kind key shown login id
-            while IFS=$'\t' read -r kind key shown; do
-              if [ "$kind" = account ]; then
-                printf '%s\t%s\t%s\n' "$kind" "$key" "$shown"
-                continue
-              fi
-              login="" id=""
-              if [[ $key =~ ^([0-9]+)\+([^@]+)@users\.noreply\.github\.com$ ]]; then
-                id=${BASH_REMATCH[1]} login=${BASH_REMATCH[2]}
-              elif [[ $key =~ ^([^@+]+)@users\.noreply\.github\.com$ ]]; then
-                login=${BASH_REMATCH[1]}
-                id=$(gh api "users/$login" --jq .id 2> /dev/null) || id=""
-              else
-                login=$(gh api -X GET search/users -f q="$key in:email" \
-                  --jq 'if .total_count == 1 then .items[0].login else "" end' 2> /dev/null) || login=""
-                if [ -n "$login" ]; then
-                  id=$(gh api "users/$login" --jq .id 2> /dev/null) || id=""
-                fi
-              fi
-              if [ -n "$id" ] && [ -n "$login" ]; then
-                printf 'account\t%s\t%s\n' "$id" "$login"
-              else
-                printf 'email\t%s\t%s\n' "$key" "$shown"
-              fi
-            done | sort -u -t $'\t' -k1,2
+          # Who opened the pull request signs too: an author is only an email, and anyone can borrow one.
+          opener() {
+            jq -r '(.pull_request // .issue).user | "account\t\(.id)\t\(.login)"' "$GITHUB_EVENT_PATH"
+          }
+
+          # The Contents API wraps its base64 every 60 characters, and @base64d refuses the line breaks.
+          decoded() {
+            jq '.content | gsub("\n"; "") | @base64d | fromjson'
           }
 
           allowed() {
@@ -143,6 +121,11 @@ jobs:
               fi
               printf '%s\t%s\t%s\n' "$kind" "$key" "$shown"
             done
+          }
+
+          # Case, spacing and a closing full stop decide nothing about a signature.
+          plain() {
+            tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//;s/\.$//'
           }
 
           worded() {
@@ -181,14 +164,36 @@ jobs:
 
           ledger() {
             GH_TOKEN=$SIGNATURES_TOKEN gh api \
-              "repos/$SIGNATURES_REPOSITORY/contents/signatures/$PROJECT/v1/cla.json"
+              "repos/$SIGNATURES_REPOSITORY/contents/signatures/$PROJECT/v1/cla.json" || {
+              printf '::error::signatures/%s/v1/cla.json could not be read from %s\n' \
+                "$PROJECT" "$SIGNATURES_REPOSITORY"
+              return 1
+            }
+          }
+
+          commits() {
+            # shellcheck disable=SC2016
+            gh api graphql --paginate \
+              -F owner="${GITHUB_REPOSITORY%/*}" -F name="${GITHUB_REPOSITORY#*/}" -F number="$NUMBER" \
+              -f query='
+                query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) {
+                      commits(first: 100, after: $endCursor) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes { commit { authors(first: 50) { nodes { email name user { databaseId login } } } } }
+                      }
+                    }
+                  }
+                }' \
+              | jq -s '[.[].data.repository.pullRequest.commits.nodes[]]'
           }
 
           owing() {
-            local signatures commits
-            signatures=$(ledger | jq '.content | @base64d | fromjson')
-            commits=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER/commits" --paginate | jq -s add)
-            people <<< "$commits" | resolve | unsigned "$signatures"
+            local signatures written
+            signatures=$(ledger | decoded)
+            written=$(commits)
+            { people <<< "$written"; opener; } | sort -u -t $'\t' -k1,2 | unsigned "$signatures"
           }
 
           check() {
@@ -210,8 +215,8 @@ jobs:
 
           sign() {
             local said login id comment at owe attempt file sha entry next err
-            said=$(jq -r .comment.body "$GITHUB_EVENT_PATH" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            if [ "$said" != "$SIGN_PHRASE" ]; then
+            said=$(jq -r .comment.body "$GITHUB_EVENT_PATH" | plain)
+            if [ "$said" != "$(printf '%s' "$SIGN_PHRASE" | plain)" ]; then
               say "a comment, not a signature"
               return 0
             fi
@@ -236,13 +241,11 @@ jobs:
             for attempt in 1 2 3 4 5; do
               file=$(ledger)
               sha=$(jq -r .sha <<< "$file")
-              if jq -e --argjson id "$id" \
-                '.content | @base64d | fromjson | any(.signedContributors[]; .id == $id)' \
-                <<< "$file" > /dev/null; then
+              if decoded <<< "$file" \
+                | jq -e --argjson id "$id" 'any(.signedContributors[]; .id == $id)' > /dev/null; then
                 break
               fi
-              next=$(jq --argjson entry "$entry" \
-                '.content | @base64d | fromjson | .signedContributors += [$entry]' <<< "$file")
+              next=$(decoded <<< "$file" | jq --argjson entry "$entry" '.signedContributors += [$entry]')
               if err=$(GH_TOKEN=$SIGNATURES_TOKEN gh api -X PUT \
                 "repos/$SIGNATURES_REPOSITORY/contents/signatures/$PROJECT/v1/cla.json" \
                 -f message="@$login has signed the CLA in $GITHUB_REPOSITORY#$NUMBER" \
@@ -264,7 +267,7 @@ jobs:
               esac
             done
 
-            rerun
+            rerun || printf '::warning::signed, but the check could not be run again; re-run it by hand\n'
           }
 
           # The check that failed ran on pull_request_target, and only running it again turns it green.
@@ -285,8 +288,11 @@ jobs:
               [ "$state" = completed ] && break
               sleep 15
             done
-            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$run/rerun" > /dev/null
-            say "the check on ${head:0:8} runs again"
+            if gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$run/rerun" > /dev/null; then
+              say "the check on ${head:0:8} runs again"
+            else
+              printf '::warning::signed, but run %s could not be run again; re-run it by hand or push\n' "$run"
+            fi
           }
 
           main() {
