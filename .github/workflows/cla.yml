@@ -1,0 +1,314 @@
+name: CLA
+
+# Called from each repository's own workflow on pull_request_target and issue_comment. It reads
+# the pull request through the API and never checks it out, so nothing a contributor wrote runs
+# with the token that writes the signatures.
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Folder under signatures/ whose v1/cla.json holds this repository's signatures.
+        type: string
+        required: true
+      document-url:
+        description: The CLA a contributor is asked to read.
+        type: string
+        required: true
+      allowlist:
+        description: Logins that never sign, comma separated; a * matches anything.
+        type: string
+        default: rgdevment,dependabot[bot],github-actions[bot]
+      sign-phrase:
+        description: The comment that signs; case and a closing full stop decide nothing.
+        type: string
+        default: I have read the CLA Document and I hereby sign the CLA
+      not-signed-message:
+        description: What the pull request is told before the phrase and the list of who has not signed.
+        type: string
+        default: >-
+          Thanks for the pull request. Whoever opened it and every author and co-author of its
+          commits has to sign the CLA before it can be merged; you keep the copyright on your work.
+          To sign, post a comment on this pull request with:
+      all-signed-message:
+        type: string
+        default: All contributors have signed the CLA. Thanks!
+    secrets:
+      signatures-token:
+        description: Fine-grained token with contents write on rgdevment/cla-signatures and nothing else.
+        required: true
+
+permissions: {}
+
+jobs:
+  signature:
+    name: signature
+    # Every comment on every pull request starts the caller; only one that holds the phrase gets a runner.
+    if: >-
+      github.event_name == 'pull_request_target'
+      || (github.event_name == 'issue_comment' && github.event.issue.pull_request
+          && contains(github.event.comment.body, inputs.sign-phrase))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      pull-requests: write
+    steps:
+      - id: cla
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SIGNATURES_TOKEN: ${{ secrets.signatures-token }}
+          SIGNATURES_REPOSITORY: rgdevment/cla-signatures
+          PROJECT: ${{ inputs.project }}
+          DOCUMENT_URL: ${{ inputs.document-url }}
+          ALLOWLIST: ${{ inputs.allowlist }}
+          SIGN_PHRASE: ${{ inputs.sign-phrase }}
+          NOT_SIGNED: ${{ inputs.not-signed-message }}
+          ALL_SIGNED: ${{ inputs.all-signed-message }}
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit 2> /dev/null || true
+
+          marker='<!-- cla-signatures -->'
+
+          say() { printf '%s\n' "$*" >&2; }
+
+          # GitHub's own reading of each commit: the git author first, then every Co-authored-by
+          # trailer, each tied to an account by any verified address, private ones included. One line
+          # per person: «account<TAB>id<TAB>login», or «email<TAB>address<TAB>name» with no account.
+          people() {
+            jq -r '
+              .[].commit.authors.nodes[]
+              | if .user.databaseId then ["account", (.user.databaseId | tostring), .user.login]
+                else ["email", ((.email // "") | ascii_downcase), (.name // "")] end
+              | @tsv' | sort -u -t $'\t' -k1,2
+          }
+
+          # Who opened the pull request signs too: an author is only an email, and anyone can borrow one.
+          opener() {
+            jq -r '(.pull_request // .issue).user | "account\t\(.id)\t\(.login)"' "$GITHUB_EVENT_PATH"
+          }
+
+          # The Contents API wraps its base64 every 60 characters, and @base64d refuses the line breaks.
+          decoded() {
+            jq '.content | gsub("\n"; "") | @base64d | fromjson'
+          }
+
+          allowed() {
+            local login=$1 pattern
+            local IFS=,
+            for pattern in $ALLOWLIST; do
+              pattern=$(printf '%s' "$pattern" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+              [ -n "$pattern" ] || continue
+              if [[ $pattern == *'*'* ]]; then
+                pattern=${pattern//[/\\[}
+                pattern=${pattern//]/\\]}
+                # shellcheck disable=SC2053
+                [[ $login == $pattern ]] && return 0
+              elif [ "$login" = "$pattern" ]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          # Everyone still owing a signature. An address with no account behind it can never sign.
+          unsigned() {
+            local signatures=$1 kind key shown
+            while IFS=$'\t' read -r kind key shown; do
+              [ -n "$kind" ] || continue
+              if [ "$kind" = account ]; then
+                allowed "$shown" && continue
+                jq -e --argjson id "$key" 'any(.signedContributors[]; .id == $id)' \
+                  <<< "$signatures" > /dev/null && continue
+              fi
+              printf '%s\t%s\t%s\n' "$kind" "$key" "$shown"
+            done
+          }
+
+          # Case, spacing and a closing full stop decide nothing about a signature.
+          plain() {
+            tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//;s/\.$//'
+          }
+
+          worded() {
+            local owe=$1 kind key shown
+            printf '%s\n%s\n\n> %s\n\nThe CLA: %s\n\nStill to sign:\n' \
+              "$marker" "$NOT_SIGNED" "$SIGN_PHRASE" "$DOCUMENT_URL"
+            while IFS=$'\t' read -r kind key shown; do
+              if [ "$kind" = account ]; then
+                printf -- '- @%s\n' "$shown"
+              else
+                shown=${shown//@/}
+                # shellcheck disable=SC2016
+                printf -- '- %s, whose address `%s` belongs to no GitHub account and so cannot sign: ' \
+                  "${shown:-someone}" "$key"
+                printf 'add it to an account, or take the commit or its credit line out\n'
+              fi
+            done <<< "$owe"
+          }
+
+          ours() {
+            gh api "repos/$GITHUB_REPOSITORY/issues/$NUMBER/comments" --paginate \
+              | jq -rs --arg m "$marker" 'add // []
+                | map(select(.user.login == "github-actions[bot]" and (.body | startswith($m))))
+                | first | .id // empty'
+          }
+
+          commented() {
+            local body=$1 found
+            found=$(ours)
+            if [ -n "$found" ]; then
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$found" -f body="$body" > /dev/null
+            else
+              gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$NUMBER/comments" -f body="$body" > /dev/null
+            fi
+          }
+
+          ledger() {
+            GH_TOKEN=$SIGNATURES_TOKEN gh api \
+              "repos/$SIGNATURES_REPOSITORY/contents/signatures/$PROJECT/v1/cla.json" || {
+              printf '::error::signatures/%s/v1/cla.json could not be read from %s\n' \
+                "$PROJECT" "$SIGNATURES_REPOSITORY" >&2
+              return 1
+            }
+          }
+
+          commits() {
+            # shellcheck disable=SC2016
+            gh api graphql --paginate \
+              -F owner="${GITHUB_REPOSITORY%/*}" -F name="${GITHUB_REPOSITORY#*/}" -F number="$NUMBER" \
+              -f query='
+                query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) {
+                      commits(first: 100, after: $endCursor) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes { commit { authors(first: 50) { nodes { email name user { databaseId login } } } } }
+                      }
+                    }
+                  }
+                }' \
+              | jq -s '[.[].data.repository.pullRequest.commits.nodes[]]'
+          }
+
+          owing() {
+            local signatures written
+            signatures=$(ledger | decoded)
+            written=$(commits)
+            { people <<< "$written"; opener; } | sort -u -t $'\t' -k1,2 | unsigned "$signatures"
+          }
+
+          check() {
+            local owe
+            owe=$(owing)
+            if [ -z "$owe" ]; then
+              if [ -n "$(ours)" ]; then
+                commented "$(printf '%s\n%s\n' "$marker" "$ALL_SIGNED")"
+              fi
+              say "everyone who wrote this pull request has signed, or never has to"
+              return 0
+            fi
+            commented "$(worded "$owe")"
+            while IFS=$'\t' read -r _ _ shown; do
+              printf '::error::%s has not signed the CLA\n' "$shown"
+            done <<< "$owe"
+            return 1
+          }
+
+          sign() {
+            local said login id comment at owe attempt file sha entry next err
+            said=$(jq -r .comment.body "$GITHUB_EVENT_PATH" | plain)
+            if [ "$said" != "$(printf '%s' "$SIGN_PHRASE" | plain)" ]; then
+              say "a comment, not a signature"
+              return 0
+            fi
+            login=$(jq -r .comment.user.login "$GITHUB_EVENT_PATH")
+            id=$(jq -r .comment.user.id "$GITHUB_EVENT_PATH")
+            comment=$(jq -r .comment.id "$GITHUB_EVENT_PATH")
+            at=$(jq -r .comment.created_at "$GITHUB_EVENT_PATH")
+
+            owe=$(owing)
+            if ! cut -f1,2 <<< "$owe" | grep -qxF "account	$id"; then
+              say "@$login owes no signature on #$NUMBER"
+              return 0
+            fi
+
+            entry=$(jq -n --arg name "$login" --argjson id "$id" --argjson comment "$comment" \
+              --arg at "$at" --argjson repo "$(jq .repository.id "$GITHUB_EVENT_PATH")" \
+              --argjson pr "$NUMBER" \
+              '{name: $name, id: $id, comment_id: $comment, created_at: $at, repoId: $repo,
+                pullRequestNo: $pr}')
+
+            # Two signatures at once race on the file's sha; the one that loses reads it again.
+            for attempt in 1 2 3 4 5; do
+              file=$(ledger)
+              sha=$(jq -r .sha <<< "$file")
+              if decoded <<< "$file" \
+                | jq -e --argjson id "$id" 'any(.signedContributors[]; .id == $id)' > /dev/null; then
+                break
+              fi
+              next=$(decoded <<< "$file" | jq --argjson entry "$entry" '.signedContributors += [$entry]')
+              if err=$(GH_TOKEN=$SIGNATURES_TOKEN gh api -X PUT \
+                "repos/$SIGNATURES_REPOSITORY/contents/signatures/$PROJECT/v1/cla.json" \
+                -f message="@$login has signed the CLA in $GITHUB_REPOSITORY#$NUMBER" \
+                -f content="$(printf '%s\n' "$next" | base64 | tr -d '\n')" \
+                -f sha="$sha" 2>&1 > /dev/null); then
+                say "@$login signed"
+                break
+              fi
+              case $err in
+                *"HTTP 409"* | *"HTTP 422"*)
+                  say "the signatures moved underneath ($attempt/5)"
+                  [ "$attempt" -lt 5 ] || { say "the signature could not be written"; return 1; }
+                  sleep $((attempt * 2))
+                  ;;
+                *)
+                  say "$err"
+                  return 1
+                  ;;
+              esac
+            done
+
+            rerun || printf '::warning::signed, but the check could not be run again; re-run it by hand\n'
+          }
+
+          # The check that failed ran on pull_request_target, and only running it again turns it green.
+          rerun() {
+            local head path run state
+            head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER" --jq .head.sha)
+            path=${GITHUB_WORKFLOW_REF#*/*/}
+            path=${path%@*}
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?event=pull_request_target&head_sha=$head&per_page=100" \
+              | jq -r --arg path "$path" '[.workflow_runs[] | select(.path == $path)][0].id // empty')
+            if [ -z "$run" ]; then
+              printf '::warning::no run of %s on %s to run again; a push to the branch checks it\n' \
+                "$path" "$head"
+              return 0
+            fi
+            for _ in $(seq 1 20); do
+              state=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" --jq .status)
+              [ "$state" = completed ] && break
+              sleep 15
+            done
+            if gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$run/rerun" > /dev/null; then
+              say "the check on ${head:0:8} runs again"
+            else
+              printf '::warning::signed, but run %s could not be run again; re-run it by hand or push\n' "$run"
+            fi
+          }
+
+          main() {
+            export GH_TOKEN=$GITHUB_TOKEN
+            case $GITHUB_EVENT_NAME in
+              pull_request_target)
+                NUMBER=$(jq -r .pull_request.number "$GITHUB_EVENT_PATH")
+                check
+                ;;
+              issue_comment)
+                NUMBER=$(jq -r .issue.number "$GITHUB_EVENT_PATH")
+                sign
+                ;;
+            esac
+          }
+
+          [ -n "${CLA_LIBRARY:-}" ] || main
