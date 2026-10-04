@@ -19,16 +19,16 @@ on:
         type: string
         default: rgdevment,dependabot[bot],github-actions[bot]
       sign-phrase:
-        description: The exact comment that signs.
+        description: The comment that signs; case and a closing full stop decide nothing.
         type: string
         default: I have read the CLA Document and I hereby sign the CLA
       not-signed-message:
         description: What the pull request is told before the phrase and the list of who has not signed.
         type: string
         default: >-
-          Thanks for the pull request. Every author and co-author has to sign the CLA before it can
-          be merged; you keep the copyright on your work. To sign, post a comment on this pull
-          request with exactly:
+          Thanks for the pull request. Whoever opened it and every author and co-author of its
+          commits has to sign the CLA before it can be merged; you keep the copyright on your work.
+          To sign, post a comment on this pull request with:
       all-signed-message:
         type: string
         default: All contributors have signed the CLA. Thanks!
@@ -42,9 +42,11 @@ permissions: {}
 jobs:
   signature:
     name: signature
+    # Every comment on every pull request starts the caller; only one that holds the phrase gets a runner.
     if: >-
       github.event_name == 'pull_request_target'
-      || (github.event_name == 'issue_comment' && github.event.issue.pull_request)
+      || (github.event_name == 'issue_comment' && github.event.issue.pull_request
+          && contains(github.event.comment.body, inputs.sign-phrase))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -166,7 +168,7 @@ jobs:
             GH_TOKEN=$SIGNATURES_TOKEN gh api \
               "repos/$SIGNATURES_REPOSITORY/contents/signatures/$PROJECT/v1/cla.json" || {
               printf '::error::signatures/%s/v1/cla.json could not be read from %s\n' \
-                "$PROJECT" "$SIGNATURES_REPOSITORY"
+                "$PROJECT" "$SIGNATURES_REPOSITORY" >&2
               return 1
             }
           }
