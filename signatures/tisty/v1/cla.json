@@ -1,3 +1,12 @@
 {
-   "signedContributors": []
+  "signedContributors": [
+    {
+      "name": "rgdevment",
+      "id": 10289498,
+      "comment_id": 5975718148,
+      "created_at": "2026-10-04T02:18:53Z",
+      "repoId": 1323711697,
+      "pullRequestNo": 117
+    }
+  ]
 }
